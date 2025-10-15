@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+import asyncio
+import os
+import sys
+from typing import List, Dict, Any
+import openai
+from playwright.async_api import async_playwright, Page
+
+openai.api_key = os.environ.get("OPENAI_API_KEY")
+if not openai.api_key:
+    raise SystemExit("Set OPENAI_API_KEY environment variable first.")
+
+
+async def generate_answer(question_text: str, choices: List[str] = None) -> Any:
+    prompt = "You are filling a Google Form. Provide a short suitable answer for the question below.\n\n"
+    prompt += f"Question: {question_text}\n"
+    if choices:
+        prompt += "Choices: " + ", ".join(choices) + "\n"
+        prompt += "Choose the best single choice (return exactly that choice) or if multiple are valid return a comma-separated list of choices.\n"
+    else:
+        prompt += "Reply with a concise answer appropriate for a short response (one sentence or phrase).\n"
+
+    response = openai.ChatCompletion.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=150,
+        temperature=0.4,
+    )
+    text = response["choices"][0]["message"]["content"].strip()
+    if choices:
+        lowered = text.lower()
+        matched = [c for c in choices if c.lower() in lowered or lowered in c.lower()]
+        if matched:
+            return matched if len(matched) > 1 else matched[0]
+        return choices[0]
+    return text
+
+
+async def parse_questions(page: Page) -> List[Dict[str, Any]]:
+    await page.wait_for_selector("form")
+    q_blocks = await page.query_selector_all(
+        'div[role="listitem"], div[class*="freebirdFormviewerComponentsQuestionBaseRoot"]'
+    )
+    result = []
+    for qb in q_blocks:
+        try:
+            qtext_el = await qb.query_selector(
+                'div[role="heading"], .freebirdFormviewerComponentsQuestionBaseTitle, .freebirdFormviewerComponentsQuestionBaseTitleHeader'
+            )
+            qtext = (await qtext_el.inner_text()) if qtext_el else ""
+            qtext = qtext.strip()
+            input_el = await qb.query_selector("input[type=\"text\"], textarea")
+            if input_el:
+                result.append(
+                    {
+                        "type": "short"
+                        if (await input_el.get_attribute("type")) == "text"
+                        else "paragraph",
+                        "text": qtext,
+                        "element": input_el,
+                    }
+                )
+                continue
+            radios = await qb.query_selector_all(
+                'div[role="list"] div[role="listitem"] [role="radio"], .freebirdFormviewerComponentsQuestionRadioChoice'
+            )
+            if radios:
+                choices = []
+                choice_labels = await qb.query_selector_all(
+                    'div[role="list"] div[role="listitem"] .docssharedWizToggleLabeledLabelText, .freebirdFormviewerComponentsQuestionRadioChoiceLabel'
+                )
+                if not choice_labels:
+                    choice_labels = await qb.query_selector_all(
+                        'div[role="list"] div[role="listitem"] span'
+                    )
+                for ch in choice_labels:
+                    txt = (await ch.inner_text()).strip()
+                    if txt:
+                        choices.append(txt)
+                input_nodes = await qb.query_selector_all(
+                    '[role="radio"], input[type="radio"]'
+                )
+                result.append(
+                    {
+                        "type": "radio",
+                        "text": qtext,
+                        "choices": choices,
+                        "inputs": input_nodes,
+                        "block": qb,
+                    }
+                )
+                continue
+            checks = await qb.query_selector_all(
+                '[role="checkbox"], input[type="checkbox"]'
+            )
+            if checks:
+                labels = await qb.query_selector_all(
+                    'div[role="list"] div[role="listitem"] .docssharedWizToggleLabeledLabelText, .freebirdFormviewerComponentsQuestionCheckboxChoiceLabel'
+                )
+                choices = (
+                    [(await l.inner_text()).strip() for l in labels] if labels else []
+                )
+                result.append(
+                    {
+                        "type": "checkbox",
+                        "text": qtext,
+                        "choices": choices,
+                        "inputs": checks,
+                        "block": qb,
+                    }
+                )
+                continue
+            select = await qb.query_selector("select, div[role=\"listbox\"]")
+            if select:
+                options = []
+                opt_els = await qb.query_selector_all(
+                    "select option, .quantumWizMenuPaperselectOption, .freebirdFormviewerComponentsQuestionSelectChoice"
+                )
+                for o in opt_els:
+                    t = (await o.inner_text()).strip()
+                    if t:
+                        options.append(t)
+                result.append(
+                    {
+                        "type": "select",
+                        "text": qtext,
+                        "choices": options,
+                        "element": select,
+                        "block": qb,
+                    }
+                )
+                continue
+            if qtext:
+                result.append({"type": "unknown", "text": qtext, "block": qb})
+        except Exception:
+            continue
+    return [r for r in result if r.get("text")]
+
+
+async def fill_and_submit(form_url: str):
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=False)
+        context = await browser.new_context()
+        page = await context.new_page()
+        print("Opening form:", form_url)
+        await page.goto(form_url)
+        await page.wait_for_load_state("domcontentloaded")
+        questions = await parse_questions(page)
+        print(f"Detected {len(questions)} questions.")
+        for i, q in enumerate(questions, start=1):
+            qtext = q.get("text") or f"Question {i}"
+            print(f"\nQ{i}: {qtext}  (type={q['type']})")
+            try:
+                if q["type"] in ("short", "paragraph"):
+                    ans = await generate_answer(qtext)
+                    print(" -> Answer:", ans)
+                    await q["element"].fill(str(ans))
+                elif q["type"] == "radio":
+                    choices = q.get("choices", [])
+                    pick = await generate_answer(qtext, choices)
+                    print(" -> Pick:", pick)
+                    matched = None
+                    for lbl in choices:
+                        want = pick[0] if isinstance(pick, list) else pick
+                        if lbl.strip().lower() == str(want).strip().lower() or str(
+                            want
+                        ).strip().lower() in lbl.strip().lower():
+                            lbl_el = await q["block"].query_selector(f'text="{lbl}"')
+                            if lbl_el:
+                                parent = await lbl_el.evaluate_handle(
+                                    "n=>n.closest('div[role=\"listitem\"]') || n"
+                                )
+                                await parent.click()
+                                matched = True
+                                break
+                    if not matched and q.get("inputs"):
+                        await q["inputs"][0].click()
+                elif q["type"] == "checkbox":
+                    choices = q.get("choices", [])
+                    pick = await generate_answer(qtext, choices)
+                    print(" -> Pick(s):", pick)
+                    picks = pick if isinstance(pick, list) else [pick]
+                    for want in picks:
+                        for lbl in choices:
+                            if want and (
+                                lbl.strip().lower() == str(want).strip().lower()
+                                or str(want).strip().lower() in lbl.strip().lower()
+                            ):
+                                lbl_el = await q["block"].query_selector(f'text="{lbl}"')
+                                if lbl_el:
+                                    parent = await lbl_el.evaluate_handle(
+                                        "n=>n.closest('div[role=\"listitem\"]') || n"
+                                    )
+                                    await parent.click()
+                                    break
+                elif q["type"] == "select":
+                    choices = q.get("choices", [])
+                    pick = await generate_answer(qtext, choices)
+                    print(" -> Select:", pick)
+                    select_el = q.get("element")
+                    try:
+                        await select_el.click()
+                    except Exception:
+                        pass
+                    opt_el = await page.query_selector(f'text="{pick}"')
+                    if opt_el:
+                        await opt_el.click()
+                else:
+                    print("Unknown question type — skipping.")
+            except Exception as e:
+                print("Error filling question:", e)
+        try:
+            submit = await page.query_selector(
+                'div[role="button"]:has-text("Submit"), button[type="submit"], text="Submit"'
+            )
+            if not submit:
+                submit = (await page.query_selector_all('div[role="button"]'))[-1]
+            if submit:
+                print("Submitting form...")
+                await submit.click()
+                await page.wait_for_timeout(2000)
+                print("Submitted.")
+            else:
+                print("Submit button not found; please submit manually.")
+        except Exception as e:
+            print("Could not submit automatically:", e)
+        await page.wait_for_timeout(3000)
+        await context.close()
+        await browser.close()
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python autofill_form.py <form_url>")
+        sys.exit(1)
+    asyncio.run(fill_and_submit(sys.argv[1]))
